@@ -1,0 +1,8 @@
+websockets>=12.0
+PyYAML>=6.0
+Pillow>=10.0
+uiautomation==2.0.29
+pywin32>=306
+comtypes>=1.4
+psutil>=5.9
+loguru>=0.7

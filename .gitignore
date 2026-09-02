@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+config.local.yaml
+.idea/
+.vscode/
+build/
+dist/

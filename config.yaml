@@ -1,0 +1,24 @@
+# 访客机 Agent 配置（复制为本地修改；token 需与 console config 一致）
+# 在虚拟机内禁止使用 127.0.0.1（那是访客机自己）
+# NAT(VMnet8) 常用宿主机网关: 192.168.159.1
+# Host-Only(VMnet1) 常用: 192.168.150.1
+
+host: "192.168.0.193"
+port: 18765
+token: "CHANGE_ME"
+
+vm_id: "VM-01"
+vm_name: "联调测试机"
+wechat_account_label: "微信客服A"
+
+enable_wechat: true
+enable_remote: true
+include_self: true
+listen_interval: 1.2
+listen_blacklist:
+  - "订阅号"
+  - "服务通知"
+
+# WebSocket 保活（需与 console config 一致）；低配 VM 可适当加大
+ws_ping_interval_sec: 60
+ws_ping_timeout_sec: 120
