@@ -9,6 +9,9 @@
   python main.py
   python main.py --config config.yaml
   python main.py --no-wechat   # 仅握手/心跳/画面，便于本机联调
+  python main.py --autostart install --no-wechat   # 登录自启（空跑）
+  python main.py --autostart uninstall
+  python main.py --autostart status
 """
 
 from __future__ import annotations
@@ -38,6 +41,12 @@ _internal = ROOT / "_internal"
 if _internal.is_dir() and str(_internal) not in sys.path:
     sys.path.insert(0, str(_internal))
 
+from agent.autostart import (
+    extra_args_from_config,
+    install as autostart_install,
+    status as autostart_status,
+    uninstall as autostart_uninstall,
+)
 from agent.service import AgentService
 from agent.win_console import disable_quick_edit
 
@@ -52,6 +61,47 @@ def load_config(path: Path) -> dict:
         data = yaml.safe_load(f) or {}
     logging.getLogger(__name__).info("已加载配置: %s", path)
     return data
+
+
+def resolve_config_path(args_config: str, default_cfg: Path) -> Path:
+    cfg_path = Path(args_config)
+    if not cfg_path.is_absolute():
+        cfg_path = (Path.cwd() / cfg_path).resolve()
+    if not cfg_path.exists() and default_cfg.exists():
+        logging.getLogger(__name__).info(
+            "未找到 %s，改用 %s", args_config, default_cfg
+        )
+        return default_cfg
+    return cfg_path
+
+
+def handle_autostart(action: str, cfg: dict, args: argparse.Namespace) -> int:
+    """处理 --autostart install|uninstall|status。"""
+    if action == "status":
+        cmd = autostart_status()
+        if cmd:
+            print(f"已启用自启: {cmd}")
+        else:
+            print("未启用自启")
+        return 0
+    if action == "uninstall":
+        autostart_uninstall()
+        return 0
+    if action == "install":
+        extras = list(extra_args_from_config(cfg))
+        # 命令行开关覆盖/追加到注册命令（与当前这次启动意图一致）
+        if args.no_wechat and "--no-wechat" not in extras:
+            extras.append("--no-wechat")
+        if args.no_remote and "--no-remote" not in extras:
+            extras.append("--no-remote")
+        if args.config and Path(args.config).resolve() != (ROOT / "config.yaml").resolve():
+            extras = ["--config", str(Path(args.config).resolve()), *extras]
+        cmd = autostart_install(extras)
+        print(f"已写入登录自启: {cmd}")
+        print("下次用户登录后生效；改参数请重新 install，关闭请 uninstall。")
+        return 0
+    print(f"未知 --autostart 动作: {action}", file=sys.stderr)
+    return 2
 
 
 def main() -> int:
@@ -72,25 +122,27 @@ def main() -> int:
         action="store_true",
         help="禁用画面采集",
     )
+    parser.add_argument(
+        "--autostart",
+        choices=("install", "uninstall", "status"),
+        metavar="ACTION",
+        help="登录自启：install / uninstall / status（写 HKCU Run，无需管理员）",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    cfg_path = resolve_config_path(args.config, default_cfg)
+    cfg = load_config(cfg_path)
+
+    if args.autostart:
+        return handle_autostart(args.autostart, cfg, args)
+
     disable_quick_edit()
 
-    cfg_path = Path(args.config)
-    if not cfg_path.is_absolute():
-        cfg_path = (Path.cwd() / cfg_path).resolve()
-    # 相对路径找不到时，回退到 exe 旁 config.yaml
-    if not cfg_path.exists() and default_cfg.exists():
-        logging.getLogger(__name__).info(
-            "未找到 %s，改用 %s", args.config, default_cfg
-        )
-        cfg_path = default_cfg
-
-    cfg = load_config(cfg_path)
     if args.no_wechat:
         cfg["enable_wechat"] = False
     if args.no_remote:

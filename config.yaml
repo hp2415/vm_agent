@@ -22,3 +22,8 @@ listen_blacklist:
 # WebSocket 保活（需与 console config 一致）；低配 VM 可适当加大
 ws_ping_interval_sec: 60
 ws_ping_timeout_sec: 120
+
+# 登录自启默认参数（改完需再执行 --autostart install 才会写入注册表）
+# 测试空跑示例: extra_args: ["--no-wechat"]
+autostart:
+  extra_args: ["--no-wechat"]
