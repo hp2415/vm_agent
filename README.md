@@ -46,7 +46,9 @@ cd D:\D\vm_agent
 powershell -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1
 ```
 
-拷贝整个 `dist\vm_agent\`，编辑**与 exe 同目录**的 `config.yaml`，再运行 `vm_agent.exe`。
+拷贝整个 `dist\vm_agent\`（含 `_internal`），编辑**与 exe 同目录**的 `config.yaml`，再运行 `vm_agent.exe`。
+
+若 venv 基于 Miniconda，打包脚本会把 `Library\bin` 里的 `ffi.dll` / OpenSSL 等打进 `_internal`；缺这些时访客机常见报错：`DLL load failed while importing _ctypes`。更稳妥可用 [python.org](https://www.python.org/downloads/) 官方 CPython 建 venv 再打包。
 
 ## 目录
 
