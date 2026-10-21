@@ -14,6 +14,8 @@ import win32clipboard
 import uiautomation as auto
 from loguru import logger
 
+from remote.input_lease import BUSY_ERROR, others_hold_input, try_input_owner
+
 
 @dataclass
 class SendResult:
@@ -170,6 +172,9 @@ def _force_activate_wechat_hwnd(
         return False
     if _user32.GetForegroundWindow() == hwnd:
         return True
+    # 远控或另一路外发正持有键鼠时，不要再点 Alt 抢前台（Alt+双击会打开属性）
+    if others_hold_input():
+        return False
 
     for attempt in range(1, attempts + 1):
         try:
@@ -186,14 +191,19 @@ def _force_activate_wechat_hwnd(
                 fg_tid = _user32.GetWindowThreadProcessId(fg_hwnd, None)
                 cur_tid = _kernel32.GetCurrentThreadId()
                 attached = False
+                alt_down = False
                 try:
                     if fg_tid and fg_tid != cur_tid:
                         attached = bool(_user32.AttachThreadInput(cur_tid, fg_tid, True))
                     _user32.keybd_event(_VK_MENU, 0, 0, 0)
+                    alt_down = True
                     _user32.keybd_event(_VK_MENU, 0, _KEYEVENTF_KEYUP, 0)
+                    alt_down = False
                     _user32.BringWindowToTop(hwnd)
                     _user32.SetForegroundWindow(hwnd)
                 finally:
+                    if alt_down:
+                        _user32.keybd_event(_VK_MENU, 0, _KEYEVENTF_KEYUP, 0)
                     if attached:
                         _user32.AttachThreadInput(cur_tid, fg_tid, False)
             else:
@@ -373,22 +383,26 @@ class WeChatController:
 
     def prepare_for_rpa(self) -> bool:
         """UI 主线程在外发 RPA 启动前调用：解除前台锁、缓存 HWND 并预激活。"""
-        allow_rpa_foreground_steal()
-        hwnd = _find_wechat_hwnd()
-        if not hwnd:
-            logger.warning("prepare_for_rpa: 未找到微信窗口")
-            return False
-        self._cached_hwnd = hwnd
-        self._uia_hwnd = 0
-        ok = _force_activate_wechat_hwnd(hwnd, None, attempts=2, settle_s=ACTIVATE_SETTLE_S)
-        if not ok:
-            ok = _force_activate_wechat_hwnd(
-                hwnd, None, attempts=1, settle_s=ACTIVATE_SETTLE_S, heavy=True
-            )
-        if ok:
-            self._mark_foreground_ok(hwnd)
-        logger.info(f"prepare_for_rpa: HWND=0x{hwnd:x}, foreground={ok}")
-        return ok
+        with try_input_owner() as owned:
+            if not owned:
+                logger.info("prepare_for_rpa: %s", BUSY_ERROR)
+                return False
+            allow_rpa_foreground_steal()
+            hwnd = _find_wechat_hwnd()
+            if not hwnd:
+                logger.warning("prepare_for_rpa: 未找到微信窗口")
+                return False
+            self._cached_hwnd = hwnd
+            self._uia_hwnd = 0
+            ok = _force_activate_wechat_hwnd(hwnd, None, attempts=2, settle_s=ACTIVATE_SETTLE_S)
+            if not ok:
+                ok = _force_activate_wechat_hwnd(
+                    hwnd, None, attempts=1, settle_s=ACTIVATE_SETTLE_S, heavy=True
+                )
+            if ok:
+                self._mark_foreground_ok(hwnd)
+            logger.info(f"prepare_for_rpa: HWND=0x{hwnd:x}, foreground={ok}")
+            return ok
 
     def _resolve_wechat_window(
         self,
@@ -1629,13 +1643,17 @@ class WeChatController:
             logger.warning("拒绝并行微信外发：已有 RPA 发送任务在执行")
             return SendResult(False, error="已有微信发送任务在执行，请稍后再试")
         try:
-            return self._send_message_with_candidates_locked(
-                candidates,
-                message,
-                cancel_event=cancel_event,
-                on_step=on_step,
-                on_confirm=on_confirm,
-            )
+            with try_input_owner() as owned:
+                if not owned:
+                    logger.info(BUSY_ERROR)
+                    return SendResult(False, error=BUSY_ERROR)
+                return self._send_message_with_candidates_locked(
+                    candidates,
+                    message,
+                    cancel_event=cancel_event,
+                    on_step=on_step,
+                    on_confirm=on_confirm,
+                )
         finally:
             self._send_lock.release()
 
@@ -1836,28 +1854,32 @@ class WeChatController:
 
     def send_images(self, receiver: str, image_paths: list[str]) -> bool:
         """向指定联系人发送一组图片。"""
-        try:
-            # 校验文件是否存在
-            valid_paths = [p for p in image_paths if os.path.exists(p)]
-            if not valid_paths:
-                logger.error(f"没有找到有效的图片文件: {image_paths}")
+        with try_input_owner() as owned:
+            if not owned:
+                logger.info(BUSY_ERROR)
                 return False
+            try:
+                # 校验文件是否存在
+                valid_paths = [p for p in image_paths if os.path.exists(p)]
+                if not valid_paths:
+                    logger.error(f"没有找到有效的图片文件: {image_paths}")
+                    return False
 
-            if not self._switch_to_chat(receiver):
+                if not self._switch_to_chat(receiver):
+                    return False
+
+                # 2. 复制图片文件到剪贴板
+                self._set_clipboard_files(valid_paths)
+
+                # 3. 粘贴并发送
+                auto.SendKeys('{CTRL}v', waitTime=1.5)
+                auto.SendKeys('{ENTER}', waitTime=0.5)
+
+                logger.info(f"成功发送 {len(valid_paths)} 张图片给 {receiver}")
+                return True
+            except Exception as e:
+                logger.error(f"发送图片给 {receiver} 失败: {e}")
                 return False
-
-            # 2. 复制图片文件到剪贴板
-            self._set_clipboard_files(valid_paths)
-
-            # 3. 粘贴并发送
-            auto.SendKeys('{CTRL}v', waitTime=1.5)
-            auto.SendKeys('{ENTER}', waitTime=0.5)
-
-            logger.info(f"成功发送 {len(valid_paths)} 张图片给 {receiver}")
-            return True
-        except Exception as e:
-            logger.error(f"发送图片给 {receiver} 失败: {e}")
-            return False
 
     def get_self_nickname(self) -> str:
         """获取当前登录账号的昵称（占位符，建议从配置获取）。"""

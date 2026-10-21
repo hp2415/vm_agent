@@ -12,6 +12,7 @@ from typing import Any
 
 from agent.mapper import sessions_to_snapshot, wx_message_to_event
 from agent.protocol import PROTOCOL, WS_PATH, encode_remote_frame, make_frame, new_id
+from remote.input_lease import ControlLease
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class AgentService:
         # remote streaming
         self._remote_active = False
         self._remote_mode = "preview"
+        self._remote_view = "jpeg"
         self._remote_fps = 6
         self._remote_quality = 50
         self._remote_max_width = 640
@@ -56,6 +58,7 @@ class AgentService:
         self._ws_ping_timeout = int(config.get("ws_ping_timeout_sec") or 120)
         self._input_queue: asyncio.Queue[dict[str, Any]] | None = None
         self._input_worker_task: asyncio.Task | None = None
+        self._control_lease = ControlLease(on_held=self._on_input_lease)
 
     async def run_forever(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -195,6 +198,16 @@ class AgentService:
                 except Exception:  # noqa: BLE001
                     pass
 
+    def _on_input_lease(self, held: bool) -> None:
+        """租约线程回调：告诉控制台现在能不能往 VNC 注入键鼠。"""
+        self._emit_threadsafe(
+            make_frame(
+                "event.input_lease",
+                vm_id=self.vm_id,
+                payload={"held": bool(held)},
+            )
+        )
+
     def _emit_threadsafe(self, frame: dict) -> None:
         loop = self._loop
         if loop is None or self._ws is None:
@@ -226,13 +239,7 @@ class AgentService:
                     self.config.get("wechat_account_label") or ""
                 ),
                 "hostname": socket.gethostname(),
-                "capabilities": [
-                    "msg.inbound",
-                    "cmd.send_text",
-                    "session.list",
-                    "remote.view",
-                    "remote.input",
-                ],
+                "capabilities": self._capabilities(),
             },
         }
         await self._send_json(hello)
@@ -244,6 +251,19 @@ class AgentService:
             raise RuntimeError(f"handshake failed: {resp}")
         self._heartbeat_interval = int(resp.get("heartbeat_interval_sec") or 15)
         logger.info("handshake ok session=%s", resp.get("session_id"))
+
+    def _capabilities(self) -> list[str]:
+        caps = [
+            "msg.inbound",
+            "cmd.send_text",
+            "session.list",
+            "remote.view",
+            "remote.input",
+        ]
+        # 口令在宿主机库存里。这里只声明「这台机器的画面走 VNC，不要再要 JPEG」。
+        if str(self.config.get("remote_view") or "jpeg") == "vnc":
+            caps.append("remote.view=vnc")
+        return caps
 
     async def _heartbeat_loop(self) -> None:
         while True:
@@ -274,6 +294,14 @@ class AgentService:
         await self._cancel_task(task)
 
     def _enqueue_remote_input(self, payload: dict[str, Any]) -> None:
+        # VNC 接管的键鼠由宿主机虚拟键鼠注入，不再走 SendInput。
+        if self._remote_view == "vnc":
+            return
+        if self._remote_mode != "control" or not self._control_lease.held:
+            action = str(payload.get("action") or "")
+            if action and action != "mouse_move":
+                logger.info("丢弃远控输入 %s：外发占用或尚未取得键鼠租约", action)
+            return
         q = self._input_queue
         if q is None:
             return
@@ -363,6 +391,8 @@ class AgentService:
                     payload={"ok": True},
                 )
             )
+        elif type_ == "cmd.remote_clipboard":
+            await self._handle_remote_clipboard(cmd_id, payload)
         elif type_ == "cmd.remote_stop":
             await self._stop_remote()
             await self._send_json(
@@ -373,6 +403,7 @@ class AgentService:
                     payload={"ok": True},
                 )
             )
+
     async def _sync_sessions(self, mode: str) -> None:
         sessions: list[Any] = []
         if self._listener is not None:
@@ -468,33 +499,76 @@ class AgentService:
         if not self.enable_remote:
             return
         mode = str(payload.get("mode") or "preview")
+        view = str(payload.get("view") or "jpeg")
         self._remote_mode = mode
+        self._remote_view = "vnc" if view == "vnc" else "jpeg"
         self._remote_fps = max(1, min(int(payload.get("fps") or 6), 20))
         self._remote_quality = max(30, min(int(payload.get("quality") or 50), 95))
         # 0 = 不缩放原分辨率
         self._remote_max_width = max(0, int(payload.get("max_width") or 640))
         self._remote_active = True
         logger.info(
-            "remote %s fps=%s quality=%s max_width=%s",
+            "remote %s view=%s fps=%s quality=%s max_width=%s",
             mode,
+            self._remote_view,
             self._remote_fps,
             self._remote_quality,
             self._remote_max_width or "native",
         )
-        if self._remote_task is None or self._remote_task.done():
+        if self._remote_view == "vnc":
+            task = self._remote_task
+            self._remote_task = None
+            await self._cancel_task(task)
+        elif self._remote_task is None or self._remote_task.done():
             self._remote_task = asyncio.create_task(self._remote_loop())
         if mode == "control":
+            self._control_lease.start()
             self._start_clipboard_watch()
         else:
+            await asyncio.to_thread(self._control_lease.stop)
             await self._stop_clipboard_watch()
 
     async def _stop_remote(self) -> None:
         self._remote_active = False
         self._remote_mode = "preview"
+        self._remote_view = "jpeg"
         task = self._remote_task
         self._remote_task = None
         await self._cancel_task(task)
         await self._stop_clipboard_watch()
+        await asyncio.to_thread(self._control_lease.stop)
+
+    async def _handle_remote_clipboard(self, cmd_id: str | None, payload: dict) -> None:
+        """控制台文本写入访客机剪贴板。外发占着租约时拒绝，避免冲掉粘贴内容。"""
+        ok = False
+        error: str | None = None
+        text = payload.get("text")
+        if payload.get("kind") not in (None, "text"):
+            error = "仅支持文本"
+        elif not self.enable_remote or self._remote_mode != "control":
+            error = "未在接管"
+        elif not isinstance(text, str) or not text:
+            error = "空文本"
+        elif len(text.encode("utf-8")) > 256 * 1024:
+            error = "文本过长"
+        elif not self._control_lease.held:
+            error = "键鼠正被占用"
+        else:
+            from remote.clipboard import text_signature, write_text
+
+            self._clipboard_sig = text_signature(text)
+            ok = await asyncio.to_thread(write_text, text)
+            if not ok:
+                error = "写入剪贴板失败"
+                self._clipboard_sig = None
+        await self._send_json(
+            make_frame(
+                "event.cmd_result",
+                id_=cmd_id or new_id("cmd"),
+                vm_id=self.vm_id,
+                payload={"ok": ok, "error": error},
+            )
+        )
 
     def _start_clipboard_watch(self) -> None:
         if self._clipboard_task is not None and not self._clipboard_task.done():

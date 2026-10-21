@@ -13,6 +13,9 @@ wechat_account_label: "微信客服A"
 
 enable_wechat: true
 enable_remote: true
+# 宿主机已为这台虚拟机打开 VNC Connections 时改为 vnc。
+# 端口和口令写在控制台库存里，不要写在这里。
+remote_view: jpeg
 include_self: true
 listen_interval: 1.2
 listen_blacklist:

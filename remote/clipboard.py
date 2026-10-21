@@ -45,3 +45,20 @@ def read_text() -> str | None:
     except Exception as exc:  # noqa: BLE001
         logger.debug("read clipboard failed: %s", exc)
         return None
+
+
+def write_text(text: str) -> bool:
+    """把 Unicode 文本写入访客机剪贴板。"""
+    try:
+        import win32clipboard
+
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
+        finally:
+            win32clipboard.CloseClipboard()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("write clipboard failed: %s", exc)
+        return False
