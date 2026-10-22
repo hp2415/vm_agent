@@ -8,3 +8,5 @@ config.local.yaml
 build/
 dist/
 *.spec
+
+tightvnc*

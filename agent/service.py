@@ -12,7 +12,7 @@ from typing import Any
 
 from agent.mapper import sessions_to_snapshot, wx_message_to_event
 from agent.protocol import PROTOCOL, WS_PATH, encode_remote_frame, make_frame, new_id
-from remote.input_lease import ControlLease
+from remote.input_lease import others_hold_input, release_modifiers
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,9 @@ class AgentService:
         self._ws_ping_timeout = int(config.get("ws_ping_timeout_sec") or 120)
         self._input_queue: asyncio.Queue[dict[str, Any]] | None = None
         self._input_worker_task: asyncio.Task | None = None
-        self._control_lease = ControlLease(on_held=self._on_input_lease)
+        self._input_gate_task: asyncio.Task | None = None
+        # 接管不长期占锁。为真表示当前没有外发占用，控制台可以注入。
+        self._input_open = False
 
     async def run_forever(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -198,15 +200,34 @@ class AgentService:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def _on_input_lease(self, held: bool) -> None:
-        """租约线程回调：告诉控制台现在能不能往 VNC 注入键鼠。"""
-        self._emit_threadsafe(
+    async def _emit_input_open(self, open_: bool) -> None:
+        """held=true 表示外发没占键鼠，控制台可以操作。"""
+        await self._send_json(
             make_frame(
                 "event.input_lease",
                 vm_id=self.vm_id,
-                payload={"held": bool(held)},
+                payload={"held": bool(open_)},
             )
         )
+
+    async def _input_gate_loop(self) -> None:
+        """接管期间只观察外发是否占着键鼠，自己不握锁。"""
+        free = not await asyncio.to_thread(others_hold_input)
+        if free:
+            await asyncio.to_thread(release_modifiers)
+        self._input_open = free
+        await self._emit_input_open(free)
+        while self._remote_active and self._remote_mode == "control":
+            free = not await asyncio.to_thread(others_hold_input)
+            if not (self._remote_active and self._remote_mode == "control"):
+                break
+            if free != self._input_open:
+                self._input_open = free
+                if free:
+                    await asyncio.to_thread(release_modifiers)
+                await self._emit_input_open(free)
+                logger.info("键鼠%s", "可操作" if free else "外发占用")
+            await asyncio.sleep(0.04)
 
     def _emit_threadsafe(self, frame: dict) -> None:
         loop = self._loop
@@ -297,10 +318,11 @@ class AgentService:
         # VNC 接管的键鼠由宿主机虚拟键鼠注入，不再走 SendInput。
         if self._remote_view == "vnc":
             return
-        if self._remote_mode != "control" or not self._control_lease.held:
-            action = str(payload.get("action") or "")
-            if action and action != "mouse_move":
-                logger.info("丢弃远控输入 %s：外发占用或尚未取得键鼠租约", action)
+        action = str(payload.get("action") or "")
+        mouse = action.startswith("mouse_")
+        if self._remote_mode != "control" or (not self._input_open and not mouse):
+            if action and not mouse:
+                logger.info("丢弃远控输入 %s：外发占用", action)
             return
         q = self._input_queue
         if q is None:
@@ -342,13 +364,18 @@ class AgentService:
                 payload = None
 
             if payload is not None:
+                mouse = str(payload.get("action") or "").startswith("mouse_")
+                if not self._input_open and not mouse:
+                    pending_move = None
+                    continue
                 if payload.get("action") == "mouse_move":
                     pending_move = payload
                 else:
                     if pending_move is not None:
                         await asyncio.to_thread(handle_input, pending_move)
                         pending_move = None
-                    await asyncio.to_thread(handle_input, payload)
+                    if self._input_open or mouse:
+                        await asyncio.to_thread(handle_input, payload)
                 continue
 
             if pending_move is not None:
@@ -522,10 +549,11 @@ class AgentService:
         elif self._remote_task is None or self._remote_task.done():
             self._remote_task = asyncio.create_task(self._remote_loop())
         if mode == "control":
-            self._control_lease.start()
+            if self._input_gate_task is None or self._input_gate_task.done():
+                self._input_gate_task = asyncio.create_task(self._input_gate_loop())
             self._start_clipboard_watch()
         else:
-            await asyncio.to_thread(self._control_lease.stop)
+            await self._stop_input_gate()
             await self._stop_clipboard_watch()
 
     async def _stop_remote(self) -> None:
@@ -536,7 +564,7 @@ class AgentService:
         self._remote_task = None
         await self._cancel_task(task)
         await self._stop_clipboard_watch()
-        await asyncio.to_thread(self._control_lease.stop)
+        await self._stop_input_gate()
 
     async def _handle_remote_clipboard(self, cmd_id: str | None, payload: dict) -> None:
         """控制台文本写入访客机剪贴板。外发占着租约时拒绝，避免冲掉粘贴内容。"""
@@ -551,7 +579,7 @@ class AgentService:
             error = "空文本"
         elif len(text.encode("utf-8")) > 256 * 1024:
             error = "文本过长"
-        elif not self._control_lease.held:
+        elif await asyncio.to_thread(others_hold_input):
             error = "键鼠正被占用"
         else:
             from remote.clipboard import text_signature, write_text
@@ -569,6 +597,12 @@ class AgentService:
                 payload={"ok": ok, "error": error},
             )
         )
+
+    async def _stop_input_gate(self) -> None:
+        self._input_open = False
+        task = self._input_gate_task
+        self._input_gate_task = None
+        await self._cancel_task(task)
 
     def _start_clipboard_watch(self) -> None:
         if self._clipboard_task is not None and not self._clipboard_task.done():
