@@ -17,6 +17,15 @@ from remote.input_lease import others_hold_input, release_modifiers
 logger = logging.getLogger(__name__)
 
 
+def _clamp_fps(raw: object) -> float:
+    """缩略图可以低于 1 帧/秒，最快不超过 20。"""
+    try:
+        fps = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        fps = 6.0
+    return max(0.2, min(fps, 20.0))
+
+
 class AgentService:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
@@ -35,6 +44,8 @@ class AgentService:
         self._heartbeat_interval = 15
         self._agent_busy = False
         self._wechat_running = False
+        self._wechat_key = ""
+        self._wechat_key_at = 0.0
         self._unread_hint = 0
         self._pending_send = 0
         self._stop = threading.Event()
@@ -163,6 +174,23 @@ class AgentService:
         except Exception as exc:  # noqa: BLE001
             logger.exception("wechat init failed (will run without RPA): %s", exc)
             self.enable_wechat = False
+
+    def _current_wechat_key(self) -> str:
+        """最多一分钟扫一次微信进程。窗口不在时不上报，避免把关窗当成换号。"""
+        if not self.enable_wechat or not self._wechat_running:
+            return ""
+        now = time.monotonic()
+        if self._wechat_key and now - self._wechat_key_at < 60:
+            return self._wechat_key
+        try:
+            from rpa.wechat_controller import WechatController
+
+            key = WechatController.get_current_wxid(self) or ""
+        except Exception:  # noqa: BLE001
+            return self._wechat_key
+        self._wechat_key = key
+        self._wechat_key_at = now
+        return key
 
     def _probe_wechat(self) -> bool:
         try:
@@ -294,6 +322,7 @@ class AgentService:
                 vm_id=self.vm_id,
                 payload={
                     "wechat_running": self._wechat_running,
+                    "wechat_key": self._current_wechat_key(),
                     "agent_busy": self._agent_busy,
                     "pending_send": self._pending_send,
                     "unread_hint": self._unread_hint,
@@ -529,7 +558,7 @@ class AgentService:
         view = str(payload.get("view") or "jpeg")
         self._remote_mode = mode
         self._remote_view = "vnc" if view == "vnc" else "jpeg"
-        self._remote_fps = max(1, min(int(payload.get("fps") or 6), 20))
+        self._remote_fps = _clamp_fps(payload.get("fps"))
         self._remote_quality = max(30, min(int(payload.get("quality") or 50), 95))
         # 0 = 不缩放原分辨率
         self._remote_max_width = max(0, int(payload.get("max_width") or 640))
@@ -642,7 +671,7 @@ class AgentService:
         from remote.capture import grab_jpeg
 
         while self._remote_active:
-            interval = 1.0 / max(self._remote_fps, 1)
+            interval = 1.0 / max(float(self._remote_fps), 0.2)
             if self._capture_busy:
                 await asyncio.sleep(min(0.1, interval))
                 continue
