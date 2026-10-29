@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import socket
@@ -10,7 +11,10 @@ import threading
 import time
 from typing import Any
 
+from pathlib import Path
+
 from agent.mapper import sessions_to_snapshot, wx_message_to_event
+from agent.metrics import HealthLog, ResourceSampler, sample_line
 from agent.protocol import PROTOCOL, WS_PATH, encode_remote_frame, make_frame, new_id
 from remote.input_lease import others_hold_input, release_modifiers
 
@@ -27,7 +31,7 @@ def _clamp_fps(raw: object) -> float:
 
 
 class AgentService:
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], health_dir: Path | None = None) -> None:
         self.config = config
         self.vm_id = str(config.get("vm_id") or "VM-01")
         self.token = str(config.get("token") or "CHANGE_ME")
@@ -72,9 +76,18 @@ class AgentService:
         self._input_gate_task: asyncio.Task | None = None
         # 接管不长期占锁。为真表示当前没有外发占用，控制台可以注入。
         self._input_open = False
+        self._metrics_watch = False
+        self._sampler = ResourceSampler()
+        log_dir = health_dir or Path.cwd()
+        self._health_log = HealthLog(log_dir / "agent-health.log")
+        atexit.register(self._note_exit)
+
+    def _note_exit(self) -> None:
+        self._health_log.line(f"vm={self.vm_id} 进程退出")
 
     async def run_forever(self) -> None:
         self._loop = asyncio.get_running_loop()
+        metrics = asyncio.create_task(self._metrics_loop())
         await self._start_input_worker()
         if self.enable_wechat:
             self._init_wechat()
@@ -113,6 +126,7 @@ class AgentService:
                         self._ws = None
                 if self._stop.is_set():
                     break
+                self._health_log.line(f"vm={self.vm_id} 控制台已断开")
                 logger.info("console 已断开，%ss 后重连（Agent 保持运行）", 3)
                 await asyncio.sleep(3)
             except asyncio.CancelledError:
@@ -126,6 +140,8 @@ class AgentService:
                 logger.warning("disconnected: %s; retry in 3s", exc)
                 await asyncio.sleep(3)
 
+        metrics.cancel()
+        await self._cancel_task(metrics)
         await self._stop_input_worker()
         logger.info("agent stopped")
 
@@ -240,6 +256,14 @@ class AgentService:
 
     async def _input_gate_loop(self) -> None:
         """接管期间只观察外发是否占着键鼠，自己不握锁。"""
+        try:
+            await self._input_gate_body()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("键鼠观察循环异常退出")
+
+    async def _input_gate_body(self) -> None:
         free = not await asyncio.to_thread(others_hold_input)
         if free:
             await asyncio.to_thread(release_modifiers)
@@ -300,6 +324,7 @@ class AgentService:
             raise RuntimeError(f"handshake failed: {resp}")
         self._heartbeat_interval = int(resp.get("heartbeat_interval_sec") or 15)
         logger.info("handshake ok session=%s", resp.get("session_id"))
+        self._health_log.line(f"vm={self.vm_id} 已连上控制台")
 
     def _capabilities(self) -> list[str]:
         caps = [
@@ -314,9 +339,37 @@ class AgentService:
             caps.append("remote.view=vnc")
         return caps
 
+    async def _metrics_loop(self) -> None:
+        """没人看详情时每分钟采样一行。打开详情后约 2 秒上报，日志仍是每分钟。"""
+        elapsed = 0.0
+        while not self._stop.is_set():
+            await asyncio.sleep(2.0)
+            if self._stop.is_set():
+                break
+            elapsed += 2.0
+            watching = self._metrics_watch
+            if not watching and elapsed < 60.0:
+                continue
+            sample = self._sampler.take()
+            if watching and self._ws is not None and sample.get("cpu_percent") is not None:
+                await self._send_json(
+                    make_frame(
+                        "event.metrics",
+                        vm_id=self.vm_id,
+                        payload=sample,
+                    )
+                )
+            if (not watching) or elapsed >= 60.0:
+                self._health_log.line(sample_line(self.vm_id, sample))
+                elapsed = 0.0
+
     async def _heartbeat_loop(self) -> None:
         while True:
+            previous = self._wechat_running
             self._wechat_running = self._probe_wechat() if self.enable_wechat else False
+            if self.enable_wechat and self._wechat_running != previous:
+                state = "在跑" if self._wechat_running else "未开"
+                self._health_log.line(f"vm={self.vm_id} 微信{state}")
             frame = make_frame(
                 "event.heartbeat",
                 vm_id=self.vm_id,
@@ -449,6 +502,12 @@ class AgentService:
             )
         elif type_ == "cmd.remote_clipboard":
             await self._handle_remote_clipboard(cmd_id, payload)
+        elif type_ == "cmd.metrics_start":
+            self._metrics_watch = True
+            logger.info("管理端开始看 %s 的资源", self.vm_id)
+        elif type_ == "cmd.metrics_stop":
+            self._metrics_watch = False
+            logger.info("管理端停止看 %s 的资源", self.vm_id)
         elif type_ == "cmd.remote_stop":
             await self._stop_remote()
             await self._send_json(

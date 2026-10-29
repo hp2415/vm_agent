@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import logging
 import signal
 import sys
@@ -104,6 +105,26 @@ def handle_autostart(action: str, cfg: dict, args: argparse.Namespace) -> int:
     return 2
 
 
+def _install_crash_log() -> None:
+    """闪退时窗口会关掉。把未捕获异常写到 exe 旁的 agent.log。"""
+    log_path = ROOT / "agent.log"
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    logging.getLogger().addHandler(file_handler)
+    crash_file = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+    faulthandler.enable(crash_file, all_threads=True)
+
+    def _excepthook(exc_type, exc, tb) -> None:
+        logging.getLogger("vm_agent").critical(
+            "未捕获异常，进程退出", exc_info=(exc_type, exc, tb)
+        )
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _excepthook
+
+
 def main() -> int:
     default_cfg = ROOT / "config.yaml"
     parser = argparse.ArgumentParser(description="Console VM Agent")
@@ -134,6 +155,7 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    _install_crash_log()
 
     cfg_path = resolve_config_path(args.config, default_cfg)
     cfg = load_config(cfg_path)
@@ -162,7 +184,7 @@ def main() -> int:
             "请改为物理机 Host-Only/NAT 网关 IP（如 192.168.159.1）"
         )
 
-    service = AgentService(cfg)
+    service = AgentService(cfg, health_dir=ROOT)
 
     def _stop(*_a):
         service.stop()
@@ -182,6 +204,9 @@ def main() -> int:
         if not service._stop.is_set():  # noqa: SLF001
             logging.getLogger(__name__).warning("unexpected cancel; exiting")
         return 0
+    except Exception:
+        logging.getLogger(__name__).exception("Agent 异常退出")
+        return 1
     return 0
 
 
