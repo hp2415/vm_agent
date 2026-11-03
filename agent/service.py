@@ -13,12 +13,22 @@ from typing import Any
 
 from pathlib import Path
 
+from agent.load_sim import DEFAULT_CPU_PERCENT, DEFAULT_MEMORY_MB, GuestLoad
 from agent.mapper import sessions_to_snapshot, wx_message_to_event
 from agent.metrics import HealthLog, ResourceSampler, sample_line
 from agent.protocol import PROTOCOL, WS_PATH, encode_remote_frame, make_frame, new_id
-from remote.input_lease import others_hold_input, release_modifiers
+from remote.input_lease import others_hold_input, release_modifiers, try_input_owner
 
 logger = logging.getLogger(__name__)
+
+
+def _hold_input_lease(seconds: float) -> bool:
+    """握住本机键鼠租约。别的进程正占着时立刻返回。"""
+    with try_input_owner() as ok:
+        if not ok:
+            return False
+        time.sleep(max(0.0, seconds))
+        return True
 
 
 def _clamp_fps(raw: object) -> float:
@@ -77,6 +87,9 @@ class AgentService:
         # 接管不长期占锁。为真表示当前没有外发占用，控制台可以注入。
         self._input_open = False
         self._metrics_watch = False
+        self._workload = bool(config.get("workload", False))
+        self._load_enabled = bool(config.get("load", False))
+        self._load: GuestLoad | None = None
         self._sampler = ResourceSampler()
         log_dir = health_dir or Path.cwd()
         self._health_log = HealthLog(log_dir / "agent-health.log")
@@ -88,6 +101,16 @@ class AgentService:
     async def run_forever(self) -> None:
         self._loop = asyncio.get_running_loop()
         metrics = asyncio.create_task(self._metrics_loop())
+        workload = None
+        if self._workload:
+            workload = asyncio.create_task(self._workload_loop())
+            logger.info("外发占用模拟已开：约每 90 秒握住键鼠 8 秒")
+        if self._load_enabled:
+            self._load = GuestLoad(
+                memory_mb=int(self.config.get("load_memory_mb") or DEFAULT_MEMORY_MB),
+                cpu_percent=float(self.config.get("load_cpu_percent") or DEFAULT_CPU_PERCENT),
+            )
+            self._load.start()
         await self._start_input_worker()
         if self.enable_wechat:
             self._init_wechat()
@@ -142,6 +165,10 @@ class AgentService:
 
         metrics.cancel()
         await self._cancel_task(metrics)
+        await self._cancel_task(workload)
+        if self._load is not None:
+            self._load.stop()
+            self._load = None
         await self._stop_input_worker()
         logger.info("agent stopped")
 
@@ -532,7 +559,61 @@ class AgentService:
                 logger.warning("get_sessions failed: %s", exc)
         await self._send_json(sessions_to_snapshot(self.vm_id, sessions, mode=mode))
 
+    async def _workload_loop(self) -> None:
+        """模拟外发占着键鼠。不点微信窗口，也不往会话里写字。"""
+        try:
+            await asyncio.sleep(15)
+            while not self._stop.is_set():
+                held = await asyncio.to_thread(_hold_input_lease, 8.0)
+                logger.info("外发占用%s", "结束" if held else "没抢到键鼠")
+                await asyncio.sleep(90)
+        except asyncio.CancelledError:
+            raise
+
+    async def _handle_loadtest_send(self, cmd_id: str | None, chat_id: str) -> None:
+        """压测外发只占键鼠并回执，不调用微信发送。回执在后台发，不堵住收包。"""
+        if not self._workload:
+            await self._finish_loadtest_send(
+                cmd_id, chat_id, ok=False, error="未开启 --workload，未写入微信"
+            )
+            return
+        asyncio.create_task(self._finish_loadtest_send(cmd_id, chat_id, ok=True, error=None))
+
+    async def _finish_loadtest_send(
+        self,
+        cmd_id: str | None,
+        chat_id: str,
+        *,
+        ok: bool,
+        error: str | None,
+    ) -> None:
+        self._pending_send += 1
+        self._agent_busy = True
+        try:
+            if ok:
+                await asyncio.to_thread(_hold_input_lease, 8.0)
+        finally:
+            self._pending_send = max(0, self._pending_send - 1)
+            self._agent_busy = False
+        await self._send_json(
+            make_frame(
+                "event.send_result",
+                id_=cmd_id or new_id("cmd"),
+                vm_id=self.vm_id,
+                payload={
+                    "ok": ok,
+                    "error": error,
+                    "chat_id": chat_id,
+                    "receiver_used": None,
+                    "receiver_source": "loadtest",
+                },
+            )
+        )
+
     async def _handle_send_text(self, cmd_id: str | None, payload: dict) -> None:
+        if str(payload.get("client_tag") or "") == "loadtest":
+            await self._handle_loadtest_send(cmd_id, str(payload.get("chat_id") or ""))
+            return
         text = str(payload.get("text") or "")
         candidates = list(payload.get("candidates") or [])
         chat_id = str(payload.get("chat_id") or "")

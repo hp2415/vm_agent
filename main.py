@@ -9,6 +9,8 @@
   python main.py
   python main.py --config config.yaml
   python main.py --no-wechat   # 仅握手/心跳/画面，便于本机联调
+  python main.py --workload    # 约每 90 秒占用键鼠 8 秒，模拟外发。不往微信写字
+  python main.py --no-wechat --load --workload   # 不打开微信，改用 CPU/内存模拟看宿主机负载
   python main.py --autostart install --no-wechat   # 登录自启（空跑）
   python main.py --autostart uninstall
   python main.py --autostart status
@@ -93,6 +95,10 @@ def handle_autostart(action: str, cfg: dict, args: argparse.Namespace) -> int:
         # 命令行开关覆盖/追加到注册命令（与当前这次启动意图一致）
         if args.no_wechat and "--no-wechat" not in extras:
             extras.append("--no-wechat")
+        if args.workload and "--workload" not in extras:
+            extras.append("--workload")
+        if args.load and "--load" not in extras:
+            extras.append("--load")
         if args.no_remote and "--no-remote" not in extras:
             extras.append("--no-remote")
         if args.config and Path(args.config).resolve() != (ROOT / "config.yaml").resolve():
@@ -144,6 +150,16 @@ def main() -> int:
         help="禁用画面采集",
     )
     parser.add_argument(
+        "--workload",
+        action="store_true",
+        help="模拟外发占用键鼠（约每 90 秒握住 8 秒），不往微信会话写字",
+    )
+    parser.add_argument(
+        "--load",
+        action="store_true",
+        help="模拟正常使用的 CPU 和内存（约 400 MB、一个处理器的 8%%）。微信已登录时不要开",
+    )
+    parser.add_argument(
         "--autostart",
         choices=("install", "uninstall", "status"),
         metavar="ACTION",
@@ -169,6 +185,10 @@ def main() -> int:
         cfg["enable_wechat"] = False
     if args.no_remote:
         cfg["enable_remote"] = False
+    if args.workload:
+        cfg["workload"] = True
+    if args.load:
+        cfg["load"] = True
 
     host = cfg.get("host") or "127.0.0.1"
     port = cfg.get("port") or 18765
