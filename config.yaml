@@ -11,7 +11,8 @@ vm_id: "VM-01"
 vm_name: "联调测试机"
 wechat_account_label: "微信客服A"
 
-enable_wechat: true
+# 微信监听默认关闭。需要时启动加 --wechat，不要只改这一项。
+enable_wechat: false
 enable_remote: true
 # 宿主机已为这台虚拟机打开 VNC Connections 时改为 vnc。
 # 端口和口令写在控制台库存里，不要写在这里。
@@ -27,6 +28,6 @@ ws_ping_interval_sec: 60
 ws_ping_timeout_sec: 120
 
 # 登录自启默认参数（改完需再执行 --autostart install 才会写入注册表）
-# 测试空跑示例: extra_args: ["--no-wechat"]
+# 默认已经不监听微信。要连微信时再写成 ["--wechat"]，改完需重新 --autostart install。
 autostart:
-  extra_args: ["--no-wechat"]
+  extra_args: []

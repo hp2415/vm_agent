@@ -6,12 +6,12 @@
 - 启用微信时：微信 4.1.9 已登录且无障碍树可见（mmui::MainWindow）
 
 用法：
-  python main.py
+  python main.py                 # 默认只做心跳和远控，不监听微信
   python main.py --config config.yaml
-  python main.py --no-wechat   # 仅握手/心跳/画面，便于本机联调
-  python main.py --workload    # 约每 90 秒占用键鼠 8 秒，模拟外发。不往微信写字
-  python main.py --no-wechat --load --workload   # 不打开微信，改用 CPU/内存模拟看宿主机负载
-  python main.py --autostart install --no-wechat   # 登录自启（空跑）
+  python main.py --wechat        # 打开微信监听和外发
+  python main.py --workload      # 约每 90 秒占用键鼠 8 秒，模拟外发。不往微信写字
+  python main.py --load --workload   # 不打开微信，改用 CPU/内存模拟看宿主机负载
+  python main.py --autostart install   # 登录自启（默认不监听微信）
   python main.py --autostart uninstall
   python main.py --autostart status
 """
@@ -93,8 +93,12 @@ def handle_autostart(action: str, cfg: dict, args: argparse.Namespace) -> int:
     if action == "install":
         extras = list(extra_args_from_config(cfg))
         # 命令行开关覆盖/追加到注册命令（与当前这次启动意图一致）
+        if args.wechat and "--wechat" not in extras:
+            extras.append("--wechat")
+            extras = [item for item in extras if item != "--no-wechat"]
         if args.no_wechat and "--no-wechat" not in extras:
             extras.append("--no-wechat")
+            extras = [item for item in extras if item != "--wechat"]
         if args.workload and "--workload" not in extras:
             extras.append("--workload")
         if args.load and "--load" not in extras:
@@ -140,9 +144,14 @@ def main() -> int:
         help=f"配置文件路径（默认: {default_cfg}）",
     )
     parser.add_argument(
+        "--wechat",
+        action="store_true",
+        help="启用微信监听和外发。默认关闭，只做心跳和远控",
+    )
+    parser.add_argument(
         "--no-wechat",
         action="store_true",
-        help="禁用微信 UIA（空跑握手/心跳/远程画面）",
+        help="明确关闭微信监听（默认已经关闭）",
     )
     parser.add_argument(
         "--no-remote",
@@ -181,8 +190,8 @@ def main() -> int:
 
     disable_quick_edit()
 
-    if args.no_wechat:
-        cfg["enable_wechat"] = False
+    # 配置里的 enable_wechat 不再单独打开监听，必须带 --wechat。
+    cfg["enable_wechat"] = bool(args.wechat) and not args.no_wechat
     if args.no_remote:
         cfg["enable_remote"] = False
     if args.workload:
@@ -197,6 +206,10 @@ def main() -> int:
         host,
         port,
         cfg.get("vm_id") or "VM-01",
+    )
+    logging.getLogger(__name__).info(
+        "微信监听: %s",
+        "开启" if cfg.get("enable_wechat") else "关闭（需要时加 --wechat）",
     )
     if str(host).strip() in ("127.0.0.1", "localhost"):
         logging.getLogger(__name__).warning(

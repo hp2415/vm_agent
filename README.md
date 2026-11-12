@@ -24,8 +24,8 @@ Agent **独立于 Console**：Console 关闭后会自动重连，不会退出。
 
 ```powershell
 # 先起 Console：cd D:\D\console && python main.py
-python main.py
-python main.py --no-wechat   # 无微信空跑
+python main.py               # 默认只做心跳和远控
+python main.py --wechat      # 打开微信监听和外发
 ```
 
 ### 登录自启（测试常用）
@@ -33,15 +33,15 @@ python main.py --no-wechat   # 无微信空跑
 写入当前用户 `HKCU\...\Run`（无需管理员；需已登录交互桌面）：
 
 ```powershell
-# 按 config.yaml 里 autostart.extra_args 注册（默认含 --no-wechat）
+# 按 config.yaml 里 autostart.extra_args 注册（默认不监听微信）
 vm_agent.exe --autostart install
-# 或显式指定空跑
-vm_agent.exe --autostart install --no-wechat
+# 自启时也打开微信监听
+vm_agent.exe --autostart install --wechat
 vm_agent.exe --autostart status
 vm_agent.exe --autostart uninstall
 ```
 
-源码同理：`python main.py --autostart install --no-wechat`。改启动参数后需重新 `install`。
+源码同理：`python main.py --autostart install`。改启动参数后需重新 `install`。
 
 `config.yaml` 的 `host` 必须是**宿主机在虚拟网卡上的 IP**（访客机内不要用 `127.0.0.1`）：
 

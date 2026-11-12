@@ -47,7 +47,7 @@ class AgentService:
         self.token = str(config.get("token") or "CHANGE_ME")
         self.host = str(config.get("host") or "127.0.0.1")
         self.port = int(config.get("port") or 18765)
-        self.enable_wechat = bool(config.get("enable_wechat", True))
+        self.enable_wechat = bool(config.get("enable_wechat", False))
         self.enable_remote = bool(config.get("enable_remote", True))
         self.include_self = bool(config.get("include_self", True))
         self.blacklist = list(config.get("listen_blacklist") or ["订阅号", "服务通知"])
@@ -339,6 +339,7 @@ class AgentService:
                     self.config.get("wechat_account_label") or ""
                 ),
                 "hostname": socket.gethostname(),
+                "role": self._seat_role(),
                 "capabilities": self._capabilities(),
             },
         }
@@ -353,17 +354,23 @@ class AgentService:
         logger.info("handshake ok session=%s", resp.get("session_id"))
         self._health_log.line(f"vm={self.vm_id} 已连上控制台")
 
+    def _seat_role(self) -> str:
+        """没开微信时只占远控座席，避免和 ocrswc 抢同一条连接。"""
+        if self.enable_wechat and self.enable_remote:
+            return "combined"
+        if not self.enable_wechat:
+            return "remote"
+        return "wechat"
+
     def _capabilities(self) -> list[str]:
-        caps = [
-            "msg.inbound",
-            "cmd.send_text",
-            "session.list",
-            "remote.view",
-            "remote.input",
-        ]
-        # 口令在宿主机库存里。这里只声明「这台机器的画面走 VNC，不要再要 JPEG」。
-        if str(self.config.get("remote_view") or "jpeg") == "vnc":
-            caps.append("remote.view=vnc")
+        caps: list[str] = []
+        if self.enable_wechat:
+            caps.extend(["msg.inbound", "cmd.send_text", "session.list"])
+        if self.enable_remote:
+            caps.extend(["remote.view", "remote.input"])
+            # 口令在宿主机库存里。这里只声明「这台机器的画面走 VNC，不要再要 JPEG」。
+            if str(self.config.get("remote_view") or "jpeg") == "vnc":
+                caps.append("remote.view=vnc")
         return caps
 
     async def _metrics_loop(self) -> None:
@@ -401,6 +408,7 @@ class AgentService:
                 "event.heartbeat",
                 vm_id=self.vm_id,
                 payload={
+                    "role": self._seat_role(),
                     "wechat_running": self._wechat_running,
                     "wechat_key": self._current_wechat_key(),
                     "agent_busy": self._agent_busy,

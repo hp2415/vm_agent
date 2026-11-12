@@ -24,8 +24,8 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 # 编辑 config.yaml：host=宿主机 IP，token 与 console 一致
-python main.py
-python main.py --no-wechat    # 无微信空跑握手/心跳/画面
+python main.py                # 默认只做心跳和远控
+python main.py --wechat       # 打开微信监听和外发
 ```
 
 打包：`scripts/build_exe.ps1` → 拷贝整个 `dist/vm_agent/`；exe **旁**的 `config.yaml` 才会被读取（勿只用 `_internal` 里的路径）。
