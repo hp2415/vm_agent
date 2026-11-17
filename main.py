@@ -194,10 +194,9 @@ def main() -> int:
     cfg["enable_wechat"] = bool(args.wechat) and not args.no_wechat
     if args.no_remote:
         cfg["enable_remote"] = False
-    if args.workload:
-        cfg["workload"] = True
-    if args.load:
-        cfg["load"] = True
+    # 外发占用、资源占用是压测。只认本次命令行，配置文件里写了也不启动。
+    cfg["workload"] = bool(args.workload)
+    cfg["load"] = bool(args.load)
 
     host = cfg.get("host") or "127.0.0.1"
     port = cfg.get("port") or 18765
@@ -210,6 +209,11 @@ def main() -> int:
     logging.getLogger(__name__).info(
         "微信监听: %s",
         "开启" if cfg.get("enable_wechat") else "关闭（需要时加 --wechat）",
+    )
+    logging.getLogger(__name__).info(
+        "占用测试: 外发占用 %s，资源占用 %s",
+        "开" if args.workload else "关（默认）",
+        "开" if args.load else "关（默认）",
     )
     if str(host).strip() in ("127.0.0.1", "localhost"):
         logging.getLogger(__name__).warning(

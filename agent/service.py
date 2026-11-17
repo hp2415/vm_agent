@@ -87,8 +87,9 @@ class AgentService:
         # 接管不长期占锁。为真表示当前没有外发占用，控制台可以注入。
         self._input_open = False
         self._metrics_watch = False
-        self._workload = bool(config.get("workload", False))
-        self._load_enabled = bool(config.get("load", False))
+        # 入口会把这两项清成命令行结果。没有 --workload / --load 时保持关闭。
+        self._workload = config.get("workload") is True
+        self._load_enabled = config.get("load") is True
         self._load: GuestLoad | None = None
         self._sampler = ResourceSampler()
         log_dir = health_dir or Path.cwd()
