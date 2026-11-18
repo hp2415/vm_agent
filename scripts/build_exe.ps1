@@ -36,11 +36,12 @@ python -m PyInstaller `
   --clean `
   --name vm_agent `
   --onedir `
-  --console `
+  --windowed `
   --noupx `
   --paths $Root `
   --hidden-import=uiautomation `
   --hidden-import=comtypes `
+  --hidden-import=agent.tray `
   --hidden-import=win32api `
   --hidden-import=win32gui `
   --hidden-import=win32con `
@@ -89,3 +90,5 @@ Write-Host "  NAT (VMnet8):       often 192.168.159.1"
 Write-Host "  Host-Only (VMnet1): often 192.168.150.1"
 Write-Host "Do NOT use 127.0.0.1 inside the guest."
 Write-Host "Then copy the whole folder into the VM and run vm_agent.exe"
+Write-Host "The exe stays in the notification area. Close the log window to keep it running."
+Write-Host "Quit from the tray icon menu. Use --console only when you need the old black window."

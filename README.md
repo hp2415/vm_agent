@@ -24,9 +24,14 @@ Agent **独立于 Console**：Console 关闭后会自动重连，不会退出。
 
 ```powershell
 # 先起 Console：cd D:\D\console && python main.py
-python main.py               # 默认只做心跳和远控
+python main.py               # 静默启动：只在任务栏通知区域留图标
 python main.py --wechat      # 打开微信监听和外发
+python main.py --console     # 传统黑窗口。关掉窗口会退出
 ```
+
+默认启动后没有控制台窗口。图标在任务栏通知区域（含「隐藏的图标」）。单击图标打开日志窗口；关掉该窗口只是收回托盘，进程继续跑。结束进程请右键图标选择「退出」。
+
+从已有命令行启动时，当前窗口会打一行提示后回到提示符，Agent 在后台继续。打包后的 `vm_agent.exe` 双击即静默驻留。
 
 ### 登录自启（测试常用）
 
@@ -61,7 +66,7 @@ cd D:\D\vm_agent
 powershell -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1
 ```
 
-拷贝整个 `dist\vm_agent\`（含 `_internal`），编辑**与 exe 同目录**的 `config.yaml`，再运行 `vm_agent.exe`。
+拷贝整个 `dist\vm_agent\`（含 `_internal`），编辑**与 exe 同目录**的 `config.yaml`，再运行 `vm_agent.exe`。exe 不带控制台窗口，驻留通知区域。
 
 若 venv 基于 Miniconda，打包脚本会把 `Library\bin` 里的 `ffi.dll` / OpenSSL 等打进 `_internal`；缺这些时访客机常见报错：`DLL load failed while importing _ctypes`。更稳妥可用 [python.org](https://www.python.org/downloads/) 官方 CPython 建 venv 再打包。
 

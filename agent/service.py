@@ -152,17 +152,17 @@ class AgentService:
                     break
                 self._health_log.line(f"vm={self.vm_id} 控制台已断开")
                 logger.info("console 已断开，%ss 后重连（Agent 保持运行）", 3)
-                await asyncio.sleep(3)
+                await self._pause(3)
             except asyncio.CancelledError:
                 if self._stop.is_set():
                     raise
                 logger.warning("连接任务被取消，3s 后重连")
-                await asyncio.sleep(3)
+                await self._pause(3)
             except Exception as exc:  # noqa: BLE001
                 if self._stop.is_set():
                     break
                 logger.warning("disconnected: %s; retry in 3s", exc)
-                await asyncio.sleep(3)
+                await self._pause(3)
 
         metrics.cancel()
         await self._cancel_task(metrics)
@@ -184,6 +184,14 @@ class AgentService:
             pass
         except Exception:  # noqa: BLE001
             pass
+
+    async def _pause(self, seconds: float) -> None:
+        """可被 stop() 打断的等待。托盘「退出」不必等满重连休眠。"""
+        left = seconds
+        while left > 0 and not self._stop.is_set():
+            step = 0.2 if left > 0.2 else left
+            await asyncio.sleep(step)
+            left -= step
 
     def stop(self) -> None:
         self._stop.set()

@@ -24,19 +24,21 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 # 编辑 config.yaml：host=宿主机 IP，token 与 console 一致
-python main.py                # 默认只做心跳和远控
+python main.py                # 静默启动，驻留通知区域
 python main.py --wechat       # 打开微信监听和外发
+python main.py --console      # 传统控制台（关掉窗口会退出）
 ```
 
-打包：`scripts/build_exe.ps1` → 拷贝整个 `dist/vm_agent/`；exe **旁**的 `config.yaml` 才会被读取（勿只用 `_internal` 里的路径）。
+打包：`scripts/build_exe.ps1` → 拷贝整个 `dist/vm_agent/`；exe **旁**的 `config.yaml` 才会被读取（勿只用 `_internal` 里的路径）。exe 为窗口子系统，启动后只在通知区域留图标。
 
 ## 目录职责
 
 ```
-main.py              # 入口；frozen 时 ROOT=exe 目录
+main.py              # 入口；frozen 时 ROOT=exe 目录；默认静默托盘
 config.yaml          # host/port/token/vm_id/监听黑名单
 agent/
   service.py         # 连接、重连、心跳、指令、远程循环
+  tray.py            # 通知区域图标 + 可收回的日志窗口
   protocol.py        # 帧辅助、RB01、title: chat_id、msg_id 哈希
   mapper.py          # WxMessage / Session → event.*
 rpa/
@@ -51,7 +53,7 @@ scripts/build_exe.ps1
 
 ## 硬性约定
 
-- **进程独立**：Console 断开只重连，不退出；仅 Ctrl+C / `stop()` 结束。
+- **进程独立**：Console 断开只重连，不退出。默认静默驻留通知区域；关掉日志窗口只是收回托盘。结束进程用托盘「退出」、`--console` 时的 Ctrl+C，或 `stop()`。
 - **网络**：访客机 `host` 禁止默认死守 `127.0.0.1`（那是访客机自己）；NAT 常用 `192.168.159.1`，Host-Only 常用 `192.168.150.1`。
 - **微信**：需交互桌面 + 4.1.9 + `mmui::MainWindow`；发送前可停 listener，发完再启。
 - **远程**：`cmd.remote_start` 的 fps/quality/max_width 在循环内即时生效；高画质接管由 Console 下发，勿被本机写死成预览档。
