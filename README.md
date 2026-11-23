@@ -86,6 +86,7 @@ scripts/build_exe.ps1
 
 - JSON：握手 / 心跳 / 会话 / 消息 / `cmd.send_text` / `cmd.remote_*`
 - 二进制画面：`RB01` + uint32 BE length + JPEG（同 WS 连接）
+- 接管声音：`event.remote_pcm`，PCM s16le 单声道 16000 Hz 的 base64（扬声器回环，预览不推）
 - `chat_id` MVP：`title:<会话名>`
 
 汇合 `work_place/desktop` 时：迁移 `agent/` + `remote/`，RPA 换 desktop 适配层；Console 协议尽量不动。

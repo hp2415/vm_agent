@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
 import json
 import logging
+import queue
 import socket
 import threading
 import time
@@ -16,7 +18,13 @@ from pathlib import Path
 from agent.load_sim import DEFAULT_CPU_PERCENT, DEFAULT_MEMORY_MB, GuestLoad
 from agent.mapper import sessions_to_snapshot, wx_message_to_event
 from agent.metrics import HealthLog, ResourceSampler, sample_line
-from agent.protocol import PROTOCOL, WS_PATH, encode_remote_frame, make_frame, new_id
+from agent.protocol import (
+    PROTOCOL,
+    WS_PATH,
+    encode_remote_frame,
+    make_frame,
+    new_id,
+)
 from remote.input_lease import others_hold_input, release_modifiers, try_input_owner
 
 logger = logging.getLogger(__name__)
@@ -76,6 +84,10 @@ class AgentService:
         self._remote_quality = 50
         self._remote_max_width = 640
         self._remote_task: asyncio.Task | None = None
+        self._audio_stop: threading.Event | None = None
+        self._audio_thread: threading.Thread | None = None
+        self._audio_chunks: queue.Queue[bytes | None] | None = None
+        self._audio_task: asyncio.Task | None = None
         self._clipboard_task: asyncio.Task | None = None
         self._clipboard_sig: str | None = None
         self._capture_busy = False
@@ -376,7 +388,7 @@ class AgentService:
         if self.enable_wechat:
             caps.extend(["msg.inbound", "cmd.send_text", "session.list"])
         if self.enable_remote:
-            caps.extend(["remote.view", "remote.input"])
+            caps.extend(["remote.view", "remote.input", "remote.audio=loopback"])
             # 口令在宿主机库存里。这里只声明「这台机器的画面走 VNC，不要再要 JPEG」。
             if str(self.config.get("remote_view") or "jpeg") == "vnc":
                 caps.append("remote.view=vnc")
@@ -738,9 +750,11 @@ class AgentService:
             if self._input_gate_task is None or self._input_gate_task.done():
                 self._input_gate_task = asyncio.create_task(self._input_gate_loop())
             self._start_clipboard_watch()
+            self._ensure_audio()
         else:
             await self._stop_input_gate()
             await self._stop_clipboard_watch()
+            await self._stop_audio()
 
     async def _stop_remote(self) -> None:
         self._remote_active = False
@@ -749,8 +763,184 @@ class AgentService:
         task = self._remote_task
         self._remote_task = None
         await self._cancel_task(task)
+        await self._stop_audio()
         await self._stop_clipboard_watch()
         await self._stop_input_gate()
+
+    def _ensure_audio(self) -> None:
+        """接管时采集扬声器。画面走 VNC 或 JPEG 都推，预览不推。"""
+        thread = self._audio_thread
+        if thread is not None and thread.is_alive():
+            if self._audio_task is None or self._audio_task.done():
+                self._audio_task = asyncio.create_task(self._audio_send_loop())
+            return
+        if self._audio_stop is None or self._audio_chunks is None:
+            self._audio_stop = threading.Event()
+            self._audio_chunks = queue.Queue(maxsize=32)
+        self._audio_thread = threading.Thread(
+            target=self._audio_capture_main,
+            name="remote-audio",
+            daemon=True,
+        )
+        self._audio_thread.start()
+        if self._audio_task is None or self._audio_task.done():
+            self._audio_task = asyncio.create_task(self._audio_send_loop())
+        logger.info("接管开始推送扬声器声音")
+
+    async def _stop_audio(self) -> None:
+        stop = self._audio_stop
+        if stop is not None:
+            stop.set()
+        chunks = self._audio_chunks
+        if chunks is not None:
+            try:
+                chunks.put_nowait(None)
+            except queue.Full:
+                try:
+                    chunks.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    chunks.put_nowait(None)
+                except queue.Full:
+                    pass
+        task = self._audio_task
+        self._audio_task = None
+        await self._cancel_task(task)
+        thread = self._audio_thread
+        self._audio_thread = None
+        self._audio_chunks = None
+        self._audio_stop = None
+        if thread is not None and thread.is_alive():
+            await asyncio.to_thread(thread.join, 1.5)
+
+    def _report_audio(self, state: str, detail: str) -> None:
+        logger.info("远控声音 %s：%s", state, detail)
+        self._emit_threadsafe(
+            make_frame(
+                "event.remote_audio",
+                vm_id=self.vm_id,
+                payload={"state": state, "detail": detail},
+            )
+        )
+
+    def _audio_capture_main(self) -> None:
+        from remote.audio import LoopbackCapture, pcm_peak
+
+        stop = self._audio_stop
+        chunks = self._audio_chunks
+        if stop is None or chunks is None:
+            return
+        cap = LoopbackCapture()
+        if not cap.open():
+            self._report_audio(
+                "unavailable",
+                "虚拟机没有可用的播放回环。请确认系统里有默认扬声器，并且 Windows Audio 服务在运行",
+            )
+            return
+        self._report_audio("opened", cap.describe())
+        heard = False
+        reported_quiet = False
+        quiet_since = time.monotonic()
+        try:
+            while not stop.is_set():
+                pcm = cap.read(0.2)
+                if stop.is_set():
+                    break
+                if pcm and pcm_peak(pcm) >= 400:
+                    quiet_since = time.monotonic()
+                    reported_quiet = False
+                    if not heard:
+                        heard = True
+                        self._report_audio("live", cap.describe())
+                elif (
+                    not heard
+                    and not reported_quiet
+                    and time.monotonic() - quiet_since > 2
+                ):
+                    reported_quiet = True
+                    extra = ""
+                    if cap.describe() != "进程回环":
+                        extra = "。虚拟声卡没有把播放送进回环，需要 Windows 10 21H2 或 Windows 11"
+                    self._report_audio("silent", "声音通道已接通，虚拟机里目前没有播出声音" + extra)
+                if not pcm:
+                    continue
+                try:
+                    chunks.put_nowait(pcm)
+                except queue.Full:
+                    try:
+                        chunks.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        chunks.put_nowait(pcm)
+                    except queue.Full:
+                        pass
+        finally:
+            cap.close()
+
+    async def _audio_send_loop(self) -> None:
+        """声音走 JSON，和「已接通」状态同一条路。二进制帧曾经到不了控制台。"""
+        from remote.audio import pcm_peak
+
+        chunks = self._audio_chunks
+        # 大约 160ms 合并成一条，避免每 40ms 一条 JSON 把画面挤在后面。
+        batch = 16000 * 2 * 160 // 1000
+        pending = bytearray()
+        held_since = 0.0
+        sent = 0
+        loudest = 0
+        logged = False
+        last_log = time.monotonic()
+
+        async def flush() -> None:
+            nonlocal sent, loudest, logged, last_log
+            if not pending:
+                return
+            pcm = bytes(pending)
+            pending.clear()
+            try:
+                await self._send_json(
+                    make_frame(
+                        "event.remote_pcm",
+                        vm_id=self.vm_id,
+                        payload={"pcm": base64.b64encode(pcm).decode("ascii")},
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("远控声音发送失败: %s", exc)
+                await asyncio.sleep(0.05)
+                return
+            sent += 1
+            level = pcm_peak(pcm)
+            if level > loudest:
+                loudest = level
+            now = time.monotonic()
+            if not logged or now - last_log >= 2.0:
+                logger.info("远控声音已送出 %s 块，峰值 %s", sent, loudest)
+                logged = True
+                last_log = now
+                loudest = 0
+
+        while self._remote_active and self._remote_mode == "control":
+            if chunks is None:
+                return
+            try:
+                pcm = chunks.get_nowait()
+            except queue.Empty:
+                if pending and time.monotonic() - held_since >= 0.16:
+                    await flush()
+                else:
+                    await asyncio.sleep(0.02)
+                continue
+            if pcm is None or not self._remote_active or self._remote_mode != "control":
+                await flush()
+                return
+            if not pending:
+                held_since = time.monotonic()
+            pending.extend(pcm)
+            if len(pending) >= batch:
+                await flush()
 
     async def _handle_remote_clipboard(self, cmd_id: str | None, payload: dict) -> None:
         """控制台文本写入访客机剪贴板。外发占着租约时拒绝，避免冲掉粘贴内容。"""

@@ -11,6 +11,9 @@ from typing import Any
 PROTOCOL = "console.agent.v1"
 WS_PATH = "/v1/agent"
 REMOTE_MAGIC = b"RB01"
+# 接管时的扬声器回环。载荷是 PCM s16le、单声道、16000 Hz。
+AUDIO_MAGIC = b"RA01"
+AUDIO_RATE = 16000
 
 
 def utc_now_iso() -> str:
@@ -42,6 +45,10 @@ def make_frame(
 
 def encode_remote_frame(jpeg: bytes) -> bytes:
     return REMOTE_MAGIC + struct.pack(">I", len(jpeg)) + jpeg
+
+
+def encode_audio_frame(pcm: bytes) -> bytes:
+    return AUDIO_MAGIC + struct.pack(">I", len(pcm)) + pcm
 
 
 def title_chat_id(title: str) -> str:

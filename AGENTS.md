@@ -47,6 +47,7 @@ rpa/
   lock.py            # 监听与外发互斥
 remote/
   capture.py         # ImageGrab → JPEG（LANCZOS；max_width<=0 不缩放）
+  audio.py           # 接管时 WASAPI 扬声器回环 → event.remote_pcm（预览不推）
   input.py           # SendInput（归一化坐标）
 scripts/build_exe.ps1
 ```
