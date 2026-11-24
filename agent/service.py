@@ -880,31 +880,51 @@ class AgentService:
             cap.close()
 
     async def _audio_send_loop(self) -> None:
-        """声音走 JSON，和「已接通」状态同一条路。二进制帧曾经到不了控制台。"""
-        from remote.audio import pcm_peak
+        """接管声音走 JSON（IMA ADPCM 4:1 压缩 + 静音抑制），兼顾流畅度与低负载。"""
+        from remote.audio import encode_ima_adpcm, pcm_peak
 
         chunks = self._audio_chunks
-        # 大约 160ms 合并成一条，避免每 40ms 一条 JSON 把画面挤在后面。
-        batch = 16000 * 2 * 160 // 1000
+        # 80 ms（2 块 40 ms）一帧，兼顾低抖动与低包率；配合 4:1 压缩约 11 KB/s，静音时 0 KB/s。
+        batch = 16000 * 2 * 80 // 1000
+        silence_threshold = 32
+        hangover_sec = 0.48
         pending = bytearray()
         held_since = 0.0
+        active_until = 0.0
+        adpcm_index = 0
         sent = 0
+        skipped = 0
         loudest = 0
         logged = False
         last_log = time.monotonic()
 
-        async def flush() -> None:
-            nonlocal sent, loudest, logged, last_log
+        async def flush(*, force: bool = False) -> None:
+            nonlocal adpcm_index, sent, skipped, loudest, logged, last_log, active_until
             if not pending:
                 return
             pcm = bytes(pending)
             pending.clear()
+            level = pcm_peak(pcm)
+            now = time.monotonic()
+            if level >= silence_threshold:
+                active_until = now + hangover_sec
+            elif not force and now > active_until:
+                # 静音拖尾结束后停止发包，避免无声空跑占用带宽与网关队列。
+                adpcm_index = 0
+                skipped += 1
+                return
+            encoded, adpcm_index = encode_ima_adpcm(pcm, adpcm_index)
+            if not encoded:
+                return
             try:
                 await self._send_json(
                     make_frame(
                         "event.remote_pcm",
                         vm_id=self.vm_id,
-                        payload={"pcm": base64.b64encode(pcm).decode("ascii")},
+                        payload={
+                            "codec": "ima_adpcm",
+                            "pcm": base64.b64encode(encoded).decode("ascii"),
+                        },
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -912,29 +932,35 @@ class AgentService:
                 await asyncio.sleep(0.05)
                 return
             sent += 1
-            level = pcm_peak(pcm)
             if level > loudest:
                 loudest = level
-            now = time.monotonic()
             if not logged or now - last_log >= 2.0:
-                logger.info("远控声音已送出 %s 块，峰值 %s", sent, loudest)
+                logger.info(
+                    "远控声音已送出 %s 块（静音跳过 %s），峰值 %s",
+                    sent,
+                    skipped,
+                    loudest,
+                )
                 logged = True
                 last_log = now
                 loudest = 0
 
+        def _next_chunk(q: queue.Queue[bytes | None]) -> tuple[bool, bytes | None]:
+            try:
+                return True, q.get(timeout=0.06)
+            except queue.Empty:
+                return False, None
+
         while self._remote_active and self._remote_mode == "control":
             if chunks is None:
                 return
-            try:
-                pcm = chunks.get_nowait()
-            except queue.Empty:
-                if pending and time.monotonic() - held_since >= 0.16:
+            got, pcm = await asyncio.to_thread(_next_chunk, chunks)
+            if not got:
+                if pending and time.monotonic() - held_since >= 0.08:
                     await flush()
-                else:
-                    await asyncio.sleep(0.02)
                 continue
             if pcm is None or not self._remote_active or self._remote_mode != "control":
-                await flush()
+                await flush(force=False)
                 return
             if not pending:
                 held_since = time.monotonic()

@@ -281,6 +281,91 @@ def pcm_peak(pcm: bytes) -> int:
     return max(abs(sample) for sample in samples)
 
 
+_IMA_INDEX_TABLE = (
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8,
+)
+_IMA_STEP_TABLE = (
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+    130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+    337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+)
+
+
+def encode_ima_adpcm(pcm: bytes, step_index: int = 0) -> tuple[bytes, int]:
+    """把 16-bit s16le 单声道 PCM 压成帧独立的 4-bit IMA ADPCM（约 4:1）。
+
+    块头 4 字节 <hBB：首采样 predictor、初始 step_index、flags（bit0=1 表示末字节高 4 位填充）。
+    每个块独立携带预测器，丢包不影响后续块解码。
+    """
+    count = len(pcm) // 2
+    if count <= 0:
+        return b"", 0
+    samples = struct.unpack(f"<{count}h", pcm[: count * 2])
+    pred = samples[0]
+    idx = 0 if step_index < 0 else (88 if step_index > 88 else int(step_index))
+    tail_count = count - 1
+    flags = tail_count & 1
+    out = bytearray(4 + ((tail_count + 1) >> 1))
+    struct.pack_into("<hBB", out, 0, pred, idx, flags)
+    index_table = _IMA_INDEX_TABLE
+    step_table = _IMA_STEP_TABLE
+    pos = 4
+    low = -1
+    for sample in samples[1:]:
+        diff = sample - pred
+        if diff < 0:
+            sign = 8
+            diff = -diff
+        else:
+            sign = 0
+        step = step_table[idx]
+        delta = 0
+        vpdiff = step >> 3
+        if diff >= step:
+            delta = 4
+            diff -= step
+            vpdiff += step
+        step >>= 1
+        if diff >= step:
+            delta |= 2
+            diff -= step
+            vpdiff += step
+        step >>= 1
+        if diff >= step:
+            delta |= 1
+            vpdiff += step
+        if sign:
+            pred -= vpdiff
+            if pred < -32768:
+                pred = -32768
+        else:
+            pred += vpdiff
+            if pred > 32767:
+                pred = 32767
+        code = delta | sign
+        idx += index_table[code]
+        if idx < 0:
+            idx = 0
+        elif idx > 88:
+            idx = 88
+        if low < 0:
+            low = code
+        else:
+            out[pos] = low | (code << 4)
+            pos += 1
+            low = -1
+    if low >= 0:
+        out[pos] = low
+    return bytes(out), idx
+
+
 class LoopbackCapture:
     """默认播放设备的 WASAPI 回环。只在采集线程里打开和关闭。"""
 
@@ -324,7 +409,7 @@ class LoopbackCapture:
                 chunk = bytes(self._pcm[:CHUNK_BYTES])
                 del self._pcm[:CHUNK_BYTES]
                 return chunk
-            time.sleep(0.01)
+            time.sleep(0.005)
         return b""
 
     def close(self) -> None:
