@@ -90,6 +90,7 @@ class AgentService:
         self._audio_task: asyncio.Task | None = None
         self._clipboard_task: asyncio.Task | None = None
         self._clipboard_sig: str | None = None
+        self._clipboard_seq: int | None = None
         self._capture_busy = False
         self._ws_ping_interval = int(config.get("ws_ping_interval_sec") or 60)
         self._ws_ping_timeout = int(config.get("ws_ping_timeout_sec") or 120)
@@ -984,11 +985,13 @@ class AgentService:
         elif await asyncio.to_thread(others_hold_input):
             error = "键鼠正被占用"
         else:
-            from remote.clipboard import text_signature, write_text
+            from remote.clipboard import sequence_number, text_signature, write_text
 
             self._clipboard_sig = text_signature(text)
             ok = await asyncio.to_thread(write_text, text)
-            if not ok:
+            if ok:
+                self._clipboard_seq = sequence_number()
+            else:
                 error = "写入剪贴板失败"
                 self._clipboard_sig = None
         await self._send_json(
@@ -1009,24 +1012,38 @@ class AgentService:
     def _start_clipboard_watch(self) -> None:
         if self._clipboard_task is not None and not self._clipboard_task.done():
             return
-        from remote.clipboard import read_text, text_signature
+        from remote.clipboard import sequence_number
 
-        seed = read_text()
-        self._clipboard_sig = text_signature(seed) if seed else None
+        # 只记录当前剪贴板序号，不主动 OpenClipboard，避免启动瞬间与其他进程争抢剪贴板。
+        self._clipboard_seq = sequence_number()
+        self._clipboard_sig = None
         self._clipboard_task = asyncio.create_task(self._clipboard_watch_loop())
 
     async def _stop_clipboard_watch(self) -> None:
         task = self._clipboard_task
         self._clipboard_task = None
         self._clipboard_sig = None
+        self._clipboard_seq = None
         await self._cancel_task(task)
 
     async def _clipboard_watch_loop(self) -> None:
-        """接管模式下轮询访客机剪贴板，变更时推 event.remote_clipboard。"""
-        from remote.clipboard import read_text, text_signature
+        """接管模式下监测访客机剪贴板变化并推 event.remote_clipboard。
+
+        先看无锁序号，未变不 OpenClipboard；外发/其他进程占用键鼠租约时完全让开。
+        """
+        from remote.clipboard import read_text_if_changed, sequence_number, text_signature
 
         while self._remote_active and self._remote_mode == "control":
-            text = await asyncio.to_thread(read_text)
+            if (not self._input_open) or await asyncio.to_thread(others_hold_input):
+                # 外发占用期间跳过并推进序号，不与监听中转站/RPA 争抢剪贴板，也不回传其粘贴文本。
+                self._clipboard_seq = sequence_number()
+                await asyncio.sleep(0.35)
+                continue
+            handled, seq, text = await asyncio.to_thread(
+                read_text_if_changed, self._clipboard_seq
+            )
+            if handled:
+                self._clipboard_seq = seq
             if text is not None:
                 sig = text_signature(text)
                 if sig != self._clipboard_sig:

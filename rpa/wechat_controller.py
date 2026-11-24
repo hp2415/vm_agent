@@ -11,6 +11,11 @@ from typing import Callable
 
 import psutil
 import win32clipboard
+
+try:
+    from remote.clipboard import CLIPBOARD_LOCK as _CLIPBOARD_LOCK
+except Exception:  # noqa: BLE001
+    _CLIPBOARD_LOCK = threading.Lock()
 import uiautomation as auto
 from loguru import logger
 
@@ -487,19 +492,20 @@ class WeChatController:
     def _clipboard_text_equals(self, expected: str) -> bool:
         """回读剪贴板 Unicode 文本，确认与期望一致。"""
         expected = expected if isinstance(expected, str) else str(expected or "")
-        try:
-            win32clipboard.OpenClipboard()
+        with _CLIPBOARD_LOCK:
             try:
-                if not win32clipboard.IsClipboardFormatAvailable(
-                    win32clipboard.CF_UNICODETEXT
-                ):
-                    return False
-                got = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
-                return (got or "") == expected
-            finally:
-                win32clipboard.CloseClipboard()
-        except Exception:
-            return False
+                win32clipboard.OpenClipboard()
+                try:
+                    if not win32clipboard.IsClipboardFormatAvailable(
+                        win32clipboard.CF_UNICODETEXT
+                    ):
+                        return False
+                    got = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+                    return (got or "") == expected
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception:
+                return False
 
     def _safe_set_clipboard_text(
         self,
@@ -520,15 +526,16 @@ class WeChatController:
                 logger.info("剪贴板写入被用户中断。")
                 return False
             try:
-                # 只用 SetClipboardData，避免 SetClipboardText 内部再次 Open 造成嵌套失败
-                win32clipboard.OpenClipboard()
-                try:
-                    win32clipboard.EmptyClipboard()
-                    win32clipboard.SetClipboardData(
-                        win32clipboard.CF_UNICODETEXT, payload
-                    )
-                finally:
-                    win32clipboard.CloseClipboard()
+                # 只用 SetClipboardData，并经进程级锁串行，避免同进程并发 OpenClipboard 损坏堆。
+                with _CLIPBOARD_LOCK:
+                    win32clipboard.OpenClipboard()
+                    try:
+                        win32clipboard.EmptyClipboard()
+                        win32clipboard.SetClipboardData(
+                            win32clipboard.CF_UNICODETEXT, payload
+                        )
+                    finally:
+                        win32clipboard.CloseClipboard()
                 time.sleep(0.03)
                 if self._clipboard_text_equals(payload):
                     return True
@@ -538,10 +545,6 @@ class WeChatController:
                 )
             except Exception as e:
                 logger.warning(f"剪贴板写入第 {i}/{attempts} 次失败: {e}")
-                try:
-                    win32clipboard.CloseClipboard()
-                except Exception:
-                    pass
             time.sleep(delay_s)
         logger.error("剪贴板写入多次失败或回读不一致，拒绝粘贴以免带入旧剪贴板内容。")
         return False
@@ -1588,12 +1591,13 @@ class WeChatController:
         files = ("\0".join([os.path.abspath(p) for p in file_paths])).replace("/", "\\")
         data = files.encode("U16")[2:] + b"\0\0"
 
-        win32clipboard.OpenClipboard()
-        try:
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardData(win32clipboard.CF_HDROP, bytes(pDropFiles) + data)
-        finally:
-            win32clipboard.CloseClipboard()
+        with _CLIPBOARD_LOCK:
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(win32clipboard.CF_HDROP, bytes(pDropFiles) + data)
+            finally:
+                win32clipboard.CloseClipboard()
 
     def _send_text_to_current(
         self,
